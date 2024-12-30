@@ -1,0 +1,3 @@
+# `farm-rust-plugin-auto-routes-linux-x64-gnu`
+
+This is the **x86_64-unknown-linux-gnu** binary for `farm-rust-plugin-auto-routes`

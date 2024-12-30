@@ -1,0 +1,214 @@
+use serde_json::Value;
+use std::{ env, fs, path::{ Path, PathBuf } };
+use regex::Regex;
+
+use crate::file_utils;
+use crate::cache_manager::Cache;
+
+lazy_static::lazy_static! {
+    static ref PAGE_FILE_REGEX: Regex = Regex::new(r"\.(jsx?|tsx?)$").unwrap();
+    static ref TYPE_FILE_REGEX: Regex = Regex::new(r"\.d\.ts$").unwrap();
+    static ref META_FILE_REGEX: Regex = Regex::new(r"\.meta\.json$").unwrap();
+    static ref IGNORE_FILE_REGEX: Regex = Regex::new(
+        &format!(
+            r"{}",
+            [
+                "const",
+                "service",
+                "services",
+                "utils",
+                "assets",
+                "styles",
+                "types",
+                "hooks",
+                "interfaces",
+                "api",
+                "constants",
+                "models",
+            ].join("|")
+        )
+    ).unwrap();
+    static ref IGNORE_DIR_REGEX: Regex = Regex::new(
+        &format!(
+            r"{}",
+            [
+                "components",
+                "service",
+                "services",
+                "utils",
+                "assets",
+                "styles",
+                "types",
+                "hooks",
+                "interfaces",
+                "api",
+                "constants",
+                "models",
+            ].join("|")
+        )
+    ).unwrap();
+}
+
+#[derive(Debug, Clone)]
+pub struct RouteContext {
+    _current_dir: PathBuf,
+    pub abs_pages_path: PathBuf,
+    write_path: PathBuf,
+    file_list_cache: Vec<String>,
+    meta_cache: Cache<String, Value>,
+    create_empty_files: Vec<String>,
+}
+
+impl RouteContext {
+    pub fn new() -> Self {
+        let current_dir = env::current_dir().unwrap(); // 当前工作目录
+        let abs_pages_path = current_dir.join("src/pages"); // pages目录的绝对路径
+        let write_path = current_dir.join("src/router"); // 输出目录的绝对路径
+
+        Self {
+            _current_dir: current_dir,
+            abs_pages_path,
+            write_path,
+            file_list_cache: Vec::new(),
+            create_empty_files: Vec::new(),
+            meta_cache: Cache::new(),
+        }
+    }
+
+    // 生成路由文件
+    pub fn init_routes(&mut self) {
+        let file_list = self.get_file_list(&self.abs_pages_path.clone(), false);
+        self.generate_file_content(file_list);
+    }
+
+    // 因新增文件而生成路由文件
+    pub fn generate_routes_on_create(&mut self, paths: Vec<PathBuf>) {
+        println!("generate_routes_on_create");
+        let mut count = 0;
+        for path in paths {
+            let path_string = path.to_string_lossy().to_string();
+            if self.is_page_file(&path_string) {
+                let content = fs::read_to_string(&path).unwrap();
+                if content.is_empty() {
+                    // 监测到新增文件，但文件内容为空，暂时记录
+                    self.create_empty_files.push(path_string.clone());
+                    println!("marker file: {}", path_string);
+                    continue;
+                }
+                count += 1;
+            }
+        }
+        if count != 0 {
+            println!("generate_routes_on_create: count: {}", count);
+            let file_list = self.get_file_list(&self.abs_pages_path.clone(), true);
+            self.generate_file_content(file_list);
+        }
+    }
+
+    pub fn generate_routes_on_modify(&mut self, path: PathBuf) {
+        // let mut clear_cache = false;
+        // let mut should_generate = false;
+        // // 先判断变更文件是否在create_empty_files中
+        // if self.create_empty_files.contains(&path.to_string_lossy().to_string()) {
+        //     clear_cache = true;
+        //     should_generate = true;
+        //     self.create_empty_files.retain(|x| x != &path.to_string_lossy().to_string());
+        // } else if self.is_meta_file(&path.to_string_lossy().to_string()) {
+        //     // 清除相应页面元数据缓存
+        //     self.meta_cache.remove(&path.to_string_lossy().to_string());
+        //     should_generate = true;
+        // }
+
+        // if should_generate {
+        //     let file_list = self.get_file_list(&self.abs_pages_path.clone(), clear_cache);
+        //     self.generate_file_content(file_list);
+        // }
+    }
+
+    pub fn generate_routes_on_remove(&mut self, path: PathBuf) {
+        let file_name = path.to_string_lossy().to_string();
+        if self.is_page_file(&file_name) || self.is_meta_file(&file_name) {
+            self.meta_cache.remove(&file_name);
+            let file_list = self.get_file_list(&self.abs_pages_path.clone(), true);
+            self.generate_file_content(file_list);
+        }
+    }
+
+    // 生成文件内容
+    fn generate_file_content(&mut self, file_list: Vec<String>) {
+        let (routes, route_components) = file_utils::parse_routes(
+            &file_list,
+            &self.abs_pages_path,
+            &self.write_path,
+            &mut self.meta_cache
+        );
+
+        let mut content = String::new();
+        content.push_str("// @ts-nocheck\n");
+        content.push_str("// this file is generated by farm-rust-plugin-auto-routes\n");
+        content.push_str("// do not change anytime!\n");
+        content.push_str("import React, { Suspense } from 'react';\n\n");
+
+        content.push_str("function withLazyLoad(LazyComponent) {\n");
+        content.push_str("  const lazyComponentWrapper = (props) => (\n");
+        content.push_str("    <Suspense fallback={props.loadingComponent}>\n");
+        content.push_str("      <LazyComponent {...props} />\n");
+        content.push_str("    </Suspense>\n");
+        content.push_str("  );\n");
+        content.push_str("  return lazyComponentWrapper;\n");
+        content.push_str("}\n\n");
+
+        content.push_str("export const getRoutes = () => {\n");
+        content.push_str(&format!("  const routes = {{{}}};\n", routes.join(",")));
+        content.push_str("  return {\n");
+        content.push_str("    routes,\n");
+        content.push_str(
+            &format!("    routeComponents: {{\n{}\n    }},\n", route_components.join(",\n"))
+        );
+        content.push_str("  };\n");
+        content.push_str("}\n");
+
+        let write_path = self.write_path.join("routes.tsx");
+
+        // 检查新内容是否与现有文件一致
+        if let Ok(existing_content) = fs::read_to_string(&write_path) {
+            if existing_content == content {
+                println!("No changes detected, skipping file write.");
+                return;
+            }
+        }
+
+        fs::write(write_path, content).expect("Failed to write route file");
+        println!("Routes file updated.");
+    }
+
+    // 获取文件列表
+    pub fn get_file_list(&mut self, dir: &Path, clear_cache: bool) -> Vec<String> {
+        if !self.file_list_cache.is_empty() && !clear_cache {
+            println!("file list cache hit");
+            return self.file_list_cache.clone();
+        }
+
+        let file_list = file_utils::scan_directory(PathBuf::from(dir));
+        let filtered_list = file_list
+            .into_iter()
+            .filter(|file| self.is_page_file(file))
+            .collect::<Vec<String>>();
+        self.file_list_cache = filtered_list.clone();
+
+        filtered_list
+    }
+
+    // 是否为页面文件
+    pub fn is_page_file(&self, file_name: &str) -> bool {
+        PAGE_FILE_REGEX.is_match(file_name) &&
+            !TYPE_FILE_REGEX.is_match(file_name) &&
+            !IGNORE_DIR_REGEX.is_match(file_name) &&
+            !IGNORE_FILE_REGEX.is_match(file_name)
+    }
+
+    // 是否为源文件
+    pub fn is_meta_file(&self, file_name: &str) -> bool {
+        META_FILE_REGEX.is_match(file_name)
+    }
+}
